@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 import urllib.request
@@ -399,6 +400,24 @@ def main() -> int:
         "/validation",
     ]
 
+    # Optional Triton runtime tracing for the dedicated inspection workflow.
+    # sitecustomize is loaded in each Python interpreter (including spawned
+    # engine workers), before importing vLLM or Triton. Other CI is unchanged.
+    trace_site_dir = os.environ.get("TRITON_TRACE_SITE_DIR", "")
+    if trace_site_dir:
+        trace_module = (Path(trace_site_dir) / "triton_runtime_sitecustomize.py").resolve()
+        if not trace_module.is_file():
+            raise FileNotFoundError(f"Triton runtime trace module missing: {trace_module}")
+        image_info = json.loads(run(
+            ["docker", "image", "inspect", args.image],
+            capture_output=True, timeout=30,
+        ).stdout)[0]
+        env_entries = image_info.get("Config", {}).get("Env") or []
+        image_pythonpath = next((e.split("=", 1)[1] for e in env_entries
+                                 if e.startswith("PYTHONPATH=")), "")
+        docker_cmd.extend(["-v", f"{trace_module}:/triton-trace-site/sitecustomize.py:ro",
+                           "-e", f"PYTHONPATH=/triton-trace-site:{image_pythonpath}"])
+
     if recipes_dir is not None:
         docker_cmd.extend(["-v", f"{recipes_dir}:/recipes:ro"])
 
@@ -564,6 +583,10 @@ def main() -> int:
         bench_cmd = [
             "docker",
             "exec",
+            # Trace only the serving engine and model runner, not the separate
+            # benchmark client process or its tokenizer/helper kernels.
+            *(["-e", "TRITON_RUNTIME_TRACE=0"]
+              if os.environ.get("TRITON_TRACE_SITE_DIR") else []),
             container,
             "vllm",
             "bench",
@@ -641,6 +664,19 @@ def main() -> int:
         result["benchmark_trust_remote_code"] = trust_remote_code
         if trust_remote_code:
             bench_cmd.append("--trust-remote-code")
+
+        # Optional, best-effort host perf sampling of native CPU execution.
+        # Start AFTER readiness and BEFORE the inference probe; the collector
+        # attaches to host PIDs visible under docker top for this container.
+        native_perf = None
+        perf_script = os.environ.get("TRITON_NATIVE_PERF_SCRIPT", "")
+        if os.environ.get("TRITON_NATIVE_CPU_PERF") == "1" and perf_script:
+            native_perf = subprocess.Popen([
+                "python3", perf_script, "--container", container,
+                "--output", str(result_dir / "native-perf"),
+                "--seconds", str(max(60, args.bench_timeout)),
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)  # Allow perf to attach before inference traffic.
         try:
             with bench_log.open("w") as log:
                 run(
@@ -663,6 +699,17 @@ def main() -> int:
             result["stages"]["benchmark"] = "FAIL"
             result["error"] = f"benchmark: {exc}"
             return_code = 1
+        finally:
+            if native_perf is not None:
+                if native_perf.poll() is None:
+                    native_perf.send_signal(signal.SIGINT)
+                try:
+                    native_perf.wait(timeout=130)
+                except subprocess.TimeoutExpired:
+                    native_perf.kill()
+                    native_perf.wait()
+                # Collection failure must not mark a successful model probe
+                # as failed; its JSON report records the profiler limitation.
         return return_code
     finally:
         if started:

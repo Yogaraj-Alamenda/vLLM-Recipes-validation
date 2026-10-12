@@ -1,0 +1,107 @@
+name: Xeon 6 MRV2 Triton Inspection
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: 'Exact HF model ID; empty inspects the full Xeon 6 catalog'
+        required: false
+        default: ''
+      vllm_image:
+        description: 'Official vLLM CPU nightly image'
+        required: false
+        default: 'vllm/vllm-openai-cpu:nightly-x86_64'
+      recipe_api_base:
+        description: 'Recipes catalog base URL'
+        required: false
+        default: 'https://recipes.vllm.ai'
+      recipe_tools_repo:
+        description: 'Optional vLLM git repository for recipe tooling'
+        required: false
+        default: ''
+      recipe_tools_ref:
+        description: 'Optional recipe tooling git ref'
+        required: false
+        default: 'main'
+      native_cpu_perf:
+        description: 'Sample native CPU function symbols using host Linux perf (best effort)'
+        type: boolean
+        required: false
+        default: true
+      probe_prompts:
+        description: 'Inference requests per model (diagnostics, not perf)'
+        required: false
+        default: '1'
+  # Intentionally manual-only; add a schedule after confirming dump support.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xeon6-triton-inspection
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    runs-on: [self-hosted, linux, x64, xeon4, recipe-validation]
+    timeout-minutes: 10080
+    env:
+      HF_HOME: ${{ vars.HF_HOME }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TEST_MODEL: ${{ inputs.model || '' }}
+      VLLM_IMAGE: ${{ inputs.vllm_image || 'vllm/vllm-openai-cpu:nightly-x86_64' }}
+      RECIPES_BASE_URL: ${{ inputs.recipe_api_base || 'https://recipes.vllm.ai' }}
+      RECIPE_TOOLS_REPO: ${{ inputs.recipe_tools_repo || '' }}
+      RECIPE_TOOLS_REF: ${{ inputs.recipe_tools_ref || 'main' }}
+      TRITON_PROBE_PROMPTS: ${{ inputs.probe_prompts || '1' }}
+      TRITON_NATIVE_CPU_PERF: ${{ inputs.native_cpu_perf && '1' || '0' }}
+      VALIDATION_RUN_ID: triton-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@v6
+      - name: Resolve Hugging Face cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo '::error::HF_TOKEN secret is required for gated model recipes'
+            exit 1
+          fi
+          CACHE="${HF_HOME:-$HOME/.cache/huggingface}"
+          [[ "$CACHE" == /* ]] || { echo '::error::HF_HOME must be absolute'; exit 1; }
+          mkdir -p "$CACHE"
+          CACHE=$(readlink -f "$CACHE")
+          touch "$CACHE/.triton-runner-write-test"
+          rm "$CACHE/.triton-runner-write-test"
+          echo "HF_HOME=$CACHE" >> "$GITHUB_ENV"
+      - name: Inspect models
+        id: inspect
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/triton_inspect.sh
+      - name: Show Triton inspection table
+        if: always()
+        shell: bash
+        run: |
+          if [[ -f triton-results/triton-summary.md ]]; then
+            cat triton-results/triton-summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo '# Triton inspection report not generated' >> "$GITHUB_STEP_SUMMARY"
+            echo 'See workflow step logs.' >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload Triton inspection artifacts
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: xeon6-triton-inspection-${{ github.run_number }}-${{ github.run_attempt }}
+          path: triton-results/
+          retention-days: 90
+      - name: Cleanup Docker disk usage
+        if: always()
+        shell: bash
+        run: |
+          docker container prune -f || true
+          docker image prune -f || true
+      - name: Fail if any model probe failed
+        if: steps.inspect.outcome == 'failure'
+        run: exit 1
