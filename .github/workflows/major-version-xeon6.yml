@@ -3,6 +3,14 @@ name: Major Version Xeon 6 Recipe Validation
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Select Xeon 6 validation runner"
+        type: choice
+        required: true
+        default: local
+        options:
+          - local
+          - aws
       vllm_version:
         description: "Fixed release (v0.31.0 or 0.31.0); used when image is empty"
         required: true
@@ -43,7 +51,15 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: [self-hosted, linux, x64, xeon6, recipe-validation]
+    # Manual dispatch defaults to local, or explicitly selects AWS.
+    # The runner must also carry the shared Xeon 6 validation labels.
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - xeon6
+      - recipe-validation
+      - ${{ inputs.runner == 'aws' && 'aws' || 'local' }}
     timeout-minutes: 10080
     env:
       HF_HOME: ${{ vars.HF_HOME }}
