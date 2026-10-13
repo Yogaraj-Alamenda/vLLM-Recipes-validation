@@ -149,21 +149,55 @@ jobs:
         if: always()
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json, os
+          python3 - <<'PYREPORT'
+          import json
+          import os
           from pathlib import Path
-          out = Path(os.environ['GITHUB_STEP_SUMMARY'])
-          path = Path(os.environ['RESULT_ROOT']) / 'weekly-summary.json'
-          if not path.is_file():
-              with out.open('a') as f:
-                  f.write('\nNo validation summary produced; see job logs.\n')
-          else:
-              data = json.loads(path.read_text())
-              with out.open('a') as f:
-                  f.write('\n| Tested | Passed | Failed |\n| ---: | ---: | ---: |\n')
+
+          report = Path(os.environ['RESULT_ROOT']) / 'weekly-summary.json'
+          output = Path(os.environ['GITHUB_STEP_SUMMARY'])
+
+          def cell(value):
+              return str(value if value is not None else '-').replace('|', '\\|').replace('\n', ' ').replace('\r', ' ')
+
+          with output.open('a') as f:
+              if not report.is_file():
+                  f.write('\n## Model validation results\n\nNo validation summary produced; see job logs.\n')
+              else:
+                  data = json.loads(report.read_text())
+                  f.write('\n## Validation results\n\n')
+                  f.write('| Tested | Passed | Failed |\n| ---: | ---: | ---: |\n')
                   f.write(f"| {data.get('tested', 0)} | {data.get('passed', 0)} | {data.get('failed', 0)} |\n")
-                  f.write('\nFull HTML report and per-model logs are in the workflow artifact.\n')
-          PY
+                  f.write('\n## Models\n\n')
+                  f.write('| Model | Status | Convert | Startup | Benchmark | Mean TTFT ms | Mean TPOT ms | Output tok/s | Error |\n')
+                  f.write('| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n')
+                  for item in data.get('models', []):
+                      status = item.get('status', 'UNKNOWN')
+                      stages = item.get('stages') or {}
+                      metrics = item.get('metrics') or {}
+                      error = cell(item.get('error') or '-')
+                      if len(error) > 180:
+                          error = error[:177] + '...'
+                      columns = [
+                          f"`{cell(item.get('model', 'unknown'))}`",
+                          ('✅ ' if status == 'PASS' else '❌ ') + cell(status),
+                          cell(stages.get('conversion', '-')),
+                          cell(stages.get('startup', '-')),
+                          cell(stages.get('benchmark', '-')),
+                          cell(metrics.get('mean_ttft_ms', '-')),
+                          cell(metrics.get('mean_tpot_ms', '-')),
+                          cell(metrics.get('output_throughput', '-')),
+                          error,
+                      ]
+                      f.write('| ' + ' | '.join(columns) + ' |\n')
+                  history = data.get('history_path')
+                  branch = os.environ.get('VALIDATED_BRANCH', '')
+                  repo = os.environ.get('GITHUB_REPOSITORY', '')
+                  base = os.environ.get('GITHUB_SERVER_URL', 'https://github.com')
+                  if history and branch and repo:
+                      f.write(f'\n[Published history for this attempt]({base}/{repo}/tree/{branch}/{history})\n')
+                  f.write('\nThe full HTML report and per-model logs are also included in the workflow artifact.\n')
+          PYREPORT
 
       - name: Upload major-version results
         if: always()
