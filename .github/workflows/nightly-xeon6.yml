@@ -68,6 +68,36 @@ jobs:
       VALIDATION_RUN_ID: nightly-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
 
     steps:
+      # Recover legacy Triton dumps before checkout cleans the persistent workspace.
+      # Old inspection runs wrote root-owned files under this directory.
+      - name: Recover legacy Triton files before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy="$GITHUB_WORKSPACE/triton-results"
+          if [[ -d "$legacy" ]]; then
+            echo "Repairing legacy Triton results at $legacy"
+            # Reuse a locally cached CPU image so recovery needs no registry pull.
+            image=""
+            for candidate in \
+              vllm/vllm-openai-cpu:nightly-x86_64 \
+              vllm/vllm-openai-cpu:nightly \
+              vllm/vllm-openai-cpu:latest-x86_64; do
+              if docker image inspect "$candidate" >/dev/null 2>&1; then
+                image="$candidate"
+                break
+              fi
+            done
+            if [[ -z "$image" ]]; then
+              echo '::error::No local vLLM CPU image for root-owned workspace repair. Run a one-time administrator cleanup.'
+              exit 1
+            fi
+            docker run --rm --user 0:0 \
+              --entrypoint /bin/sh \
+              -v "$legacy:/repair" "$image" \
+              -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+            rm -rf -- "$legacy"
+          fi
       - name: Checkout validation harness
         uses: actions/checkout@v6
 

@@ -56,6 +56,9 @@ jobs:
       TRITON_PROBE_PROMPTS: ${{ inputs.probe_prompts || '1' }}
       TRITON_NATIVE_CPU_PERF: ${{ inputs.native_cpu_perf && '1' || '0' }}
       VALIDATION_RUN_ID: triton-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+      # Per-attempt paths outside the checkout. Docker may write as root.
+      RESULT_ROOT: ${{ runner.temp }}/triton-${{ github.run_id }}-${{ github.run_attempt }}/results
+      WORK_ROOT: ${{ runner.temp }}/triton-${{ github.run_id }}-${{ github.run_attempt }}/work
     steps:
       - name: Checkout validation harness
         uses: actions/checkout@v6
@@ -79,12 +82,26 @@ jobs:
         continue-on-error: true
         shell: bash
         run: bash scripts/triton_inspect.sh
+      - name: Restore inspection artifact ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The vLLM image used by the probe is already pulled. Run ownership
+          # repair as container-root; no passwordless host sudo is required.
+          for dir in "$RESULT_ROOT" "$WORK_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            docker run --rm --user 0:0 \
+              --entrypoint /bin/sh \
+              -v "$dir:/repair" "$VLLM_IMAGE" \
+              -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+          done
       - name: Show Triton inspection table
         if: always()
         shell: bash
         run: |
-          if [[ -f triton-results/triton-summary.md ]]; then
-            cat triton-results/triton-summary.md >> "$GITHUB_STEP_SUMMARY"
+          if [[ -f "$RESULT_ROOT/triton-summary.md" ]]; then
+            cat "$RESULT_ROOT/triton-summary.md" >> "$GITHUB_STEP_SUMMARY"
           else
             echo '# Triton inspection report not generated' >> "$GITHUB_STEP_SUMMARY"
             echo 'See workflow step logs.' >> "$GITHUB_STEP_SUMMARY"
@@ -94,8 +111,18 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: xeon6-triton-inspection-${{ github.run_number }}-${{ github.run_attempt }}
-          path: triton-results/
+          path: ${{ env.RESULT_ROOT }}/
           retention-days: 90
+      - name: Remove isolated inspection scratch data
+        if: always()
+        shell: bash
+        run: |
+          # Preserve failures in logs while cleaning files after artifact upload.
+          # Only remove this run attempt's temporary directories.
+          for dir in "$RESULT_ROOT" "$WORK_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            rm -rf -- "$dir" || echo "::warning::Could not remove $dir"
+          done
       - name: Cleanup Docker disk usage
         if: always()
         shell: bash

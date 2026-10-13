@@ -12,10 +12,15 @@ export TRITON_NATIVE_PERF_SCRIPT="$ROOT/scripts/native_cpu_perf.py"
 export VLLM_TEST_ENV_VARS="${VLLM_TEST_ENV_VARS:-} VLLM_USE_V2_MODEL_RUNNER=1 TRITON_KERNEL_DUMP=1 TRITON_DUMP_DIR=/results/triton TRITON_RUNTIME_TRACE=1 TRITON_RUNTIME_TRACE_OUTPUT=/results/triton-launches.jsonl"
 RUN_DATE=$(date -u +%F)
 RUN_ID=${VALIDATION_RUN_ID:-triton-local-$(date -u +%Y%m%dT%H%M%SZ)}
-INSPECTION_ROOT="$ROOT/triton-results"
+INSPECTION_ROOT="${RESULT_ROOT:-$ROOT/triton-results}"
 RESULT_MODELS="$INSPECTION_ROOT/models"
 mkdir -p "$WORK_ROOT" "$HF_HOME"
-rm -rf "$INSPECTION_ROOT"
+# Do not delete arbitrary paths supplied by environment variables.
+if [[ -z "$INSPECTION_ROOT" || "$INSPECTION_ROOT" == / || "$INSPECTION_ROOT" == "$ROOT" ]]; then
+  echo "::error::Unsafe Triton inspection output directory: $INSPECTION_ROOT" >&2
+  exit 2
+fi
+rm -rf -- "$INSPECTION_ROOT"
 mkdir -p "$RESULT_MODELS"
 
 docker info >/dev/null
