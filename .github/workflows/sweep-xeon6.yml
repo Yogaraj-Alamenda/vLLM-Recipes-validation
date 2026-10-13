@@ -3,6 +3,14 @@ name: Xeon 6 Recipe Sweep
 on:
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Select Xeon 6 runner"
+        required: true
+        type: choice
+        default: local
+        options:
+          - local
+          - aws
       model:
         description: "Exact model ID to sweep (one model per run)"
         required: true
@@ -74,7 +82,13 @@ concurrency:
 
 jobs:
   sweep:
-    runs-on: [self-hosted, linux, x64, xeon6, recipe-validation]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - xeon6
+      - recipe-validation
+      - ${{ inputs.runner == 'aws' && 'aws' || 'local' }}
     timeout-minutes: 10080
 
     env:
