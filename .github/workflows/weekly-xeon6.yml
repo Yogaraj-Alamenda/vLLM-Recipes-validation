@@ -50,8 +50,6 @@ jobs:
       HF_HOME: ${{ vars.HF_HOME }}
       # Each attempt uses scratch outside checkout. Root-owned Docker files
       # cannot poison actions/checkout on subsequent jobs on this runner.
-      WORK_ROOT: ${{ runner.temp }}/xeon6-weekly-${{ github.run_id }}-${{ github.run_attempt }}/work
-      RESULT_ROOT: ${{ runner.temp }}/xeon6-weekly-${{ github.run_id }}-${{ github.run_attempt }}/results
       # HF_TOKEN should be stored as an internal-repo/environment secret if gated
       # models are part of the Xeon recipe catalog.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -67,6 +65,15 @@ jobs:
       VALIDATION_RUN_ID: run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
 
     steps:
+      - name: Initialize isolated scratch directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/xeon6-weekly-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$scratch/work" "$scratch/results"
+          echo "WORK_ROOT=$scratch/work" >> "$GITHUB_ENV"
+          echo "RESULT_ROOT=$scratch/results" >> "$GITHUB_ENV"
+
       - name: Checkout validation harness
         uses: actions/checkout@v6
 

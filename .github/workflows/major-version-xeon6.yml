@@ -55,12 +55,19 @@ jobs:
       VLLM_TEST_ENV_VARS: ${{ inputs.vllm_env_vars || '' }}
       BENCH_NUM_PROMPTS: "20"
       VALIDATION_RUN_ID: major-${{ github.run_number }}-attempt-${{ github.run_attempt }}
-      WORK_ROOT: ${{ runner.temp }}/xeon6-major-${{ github.run_id }}-${{ github.run_attempt }}/work
-      RESULT_ROOT: ${{ runner.temp }}/xeon6-major-${{ github.run_id }}-${{ github.run_attempt }}/results
       REQUESTED_VERSION: ${{ inputs.vllm_version }}
       REQUESTED_IMAGE: ${{ inputs.vllm_image }}
 
     steps:
+      - name: Initialize isolated scratch directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/xeon6-major-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$scratch/work" "$scratch/results"
+          echo "WORK_ROOT=$scratch/work" >> "$GITHUB_ENV"
+          echo "RESULT_ROOT=$scratch/results" >> "$GITHUB_ENV"
+
       - name: Checkout validation harness
         uses: actions/checkout@v6
 

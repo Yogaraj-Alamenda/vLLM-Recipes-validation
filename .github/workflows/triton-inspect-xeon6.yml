@@ -57,9 +57,16 @@ jobs:
       TRITON_NATIVE_CPU_PERF: ${{ inputs.native_cpu_perf && '1' || '0' }}
       VALIDATION_RUN_ID: triton-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
       # Per-attempt paths outside the checkout. Docker may write as root.
-      RESULT_ROOT: ${{ runner.temp }}/triton-${{ github.run_id }}-${{ github.run_attempt }}/results
-      WORK_ROOT: ${{ runner.temp }}/triton-${{ github.run_id }}-${{ github.run_attempt }}/work
     steps:
+      - name: Initialize isolated scratch directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/triton-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$scratch/work" "$scratch/results"
+          echo "WORK_ROOT=$scratch/work" >> "$GITHUB_ENV"
+          echo "RESULT_ROOT=$scratch/results" >> "$GITHUB_ENV"
+
       - name: Checkout validation harness
         uses: actions/checkout@v6
       - name: Resolve Hugging Face cache
