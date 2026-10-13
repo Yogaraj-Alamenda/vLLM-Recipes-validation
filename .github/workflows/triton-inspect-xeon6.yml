@@ -1,4 +1,4 @@
-name: Xeon 6 MRV2 Triton Inspection
+name: Triton Kernel Inspection
 
 on:
   workflow_dispatch:

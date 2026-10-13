@@ -1,0 +1,184 @@
+name: Major Version Xeon 6 Recipe Validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      vllm_version:
+        description: "Fixed release (v0.31.0 or 0.31.0); used when image is empty"
+        required: true
+        default: "v0.31.0"
+      vllm_image:
+        description: "Optional full Docker image override (takes precedence over version)"
+        required: false
+        default: ""
+      model:
+        description: "Optional exact model ID; empty validates all Xeon 6 recipes"
+        required: false
+        default: ""
+      recipe_api_base:
+        description: "Recipes API URL"
+        required: false
+        default: "https://recipes.vllm.ai"
+      vllm_env_vars:
+        description: "Optional non-secret container environment KEY=VALUE pairs"
+        required: false
+        default: ""
+      recipe_tools_repo:
+        description: "Optional vLLM Git URL for recipe tools absent from pinned images"
+        required: false
+        default: ""
+      recipe_tools_ref:
+        description: "Recipe tooling branch, tag, or commit"
+        required: false
+        default: "main"
+
+permissions:
+  contents: write
+
+# Independent from weekly runs; per-attempt scratch and version-scoped
+# publication branches prevent cross-run workspace and catalog contamination.
+concurrency:
+  group: major-version-xeon6-${{ inputs.vllm_version }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: [self-hosted, linux, x64, xeon6, recipe-validation]
+    timeout-minutes: 10080
+    env:
+      HF_HOME: ${{ vars.HF_HOME }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      RECIPE_TOOLS_REPO: ${{ inputs.recipe_tools_repo }}
+      RECIPE_TOOLS_REF: ${{ inputs.recipe_tools_ref || 'main' }}
+      TEST_MODEL: ${{ inputs.model }}
+      RECIPES_BASE_URL: ${{ inputs.recipe_api_base || 'https://recipes.vllm.ai' }}
+      VLLM_TEST_ENV_VARS: ${{ inputs.vllm_env_vars || '' }}
+      BENCH_NUM_PROMPTS: "20"
+      VALIDATION_RUN_ID: major-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+      WORK_ROOT: ${{ runner.temp }}/xeon6-major-${{ github.run_id }}-${{ github.run_attempt }}/work
+      RESULT_ROOT: ${{ runner.temp }}/xeon6-major-${{ github.run_id }}-${{ github.run_attempt }}/results
+      REQUESTED_VERSION: ${{ inputs.vllm_version }}
+      REQUESTED_IMAGE: ${{ inputs.vllm_image }}
+
+    steps:
+      - name: Checkout validation harness
+        uses: actions/checkout@v6
+
+      - name: Resolve pinned release image and branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$REQUESTED_VERSION"
+          [[ "$version" == v* ]] || version="v$version"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::vllm_version must be a release like v0.31.0"
+            exit 2
+          fi
+          image="${REQUESTED_IMAGE:-vllm/vllm-openai-cpu:${version}-x86_64}"
+          [[ -n "$image" && "$image" != *$'\n'* ]] || exit 2
+          echo "VLLM_IMAGE=$image" >> "$GITHUB_ENV"
+          echo "VALIDATED_BRANCH=validated-xeon6-${version}" >> "$GITHUB_ENV"
+          echo "**Pinned release:** \`$version\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Docker image:** \`$image\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Publication branch:** \`validated-xeon6-${version}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check Hugging Face configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${HF_TOKEN:-}" ]]; then
+            echo "::error::HF_TOKEN repository secret is not configured"
+            exit 1
+          fi
+          resolved="${HF_HOME:-$HOME/.cache/huggingface}"
+          [[ "$resolved" == /* ]] || { echo "::error::HF_HOME must be absolute"; exit 1; }
+          mkdir -p "$resolved"
+          resolved=$(readlink -f "$resolved")
+          probe="$resolved/.major-runner-write-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          touch "$probe"
+          rm -f "$probe"
+          echo "HF_HOME=$resolved" >> "$GITHUB_ENV"
+          df -h "$resolved"
+
+      - name: Restore previous validated catalog for this release
+        run: ./scripts/hydrate_validated.sh
+
+      - name: Run pinned Xeon 6 recipe validation
+        id: test
+        continue-on-error: true
+        run: ./scripts/weekly.sh
+
+      - name: Restore scratch ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${VLLM_IMAGE:-}" ]] && docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+            for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+              [[ -d "$dir" ]] || continue
+              docker run --rm --user 0:0 --entrypoint /bin/sh \
+                -v "$dir:/repair" "$VLLM_IMAGE" \
+                -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+            done
+          fi
+
+      - name: Report pinned release results
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out = Path(os.environ['GITHUB_STEP_SUMMARY'])
+          path = Path(os.environ['RESULT_ROOT']) / 'weekly-summary.json'
+          if not path.is_file():
+              with out.open('a') as f:
+                  f.write('\nNo validation summary produced; see job logs.\n')
+          else:
+              data = json.loads(path.read_text())
+              with out.open('a') as f:
+                  f.write('\n| Tested | Passed | Failed |\n| ---: | ---: | ---: |\n')
+                  f.write(f"| {data.get('tested', 0)} | {data.get('passed', 0)} | {data.get('failed', 0)} |\n")
+                  f.write('\nFull HTML report and per-model logs are in the workflow artifact.\n')
+          PY
+
+      - name: Upload major-version results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: xeon6-major-${{ github.run_number }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RESULT_ROOT }}/
+            history/**/${{ env.VALIDATION_RUN_ID }}/
+          retention-days: 90
+
+      - name: Upload validated bundles
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: xeon6-major-validated-${{ github.run_number }}-${{ github.run_attempt }}
+          path: validated/
+          retention-days: 90
+
+      - name: Publish version-specific known-good catalog
+        if: always()
+        run: ./scripts/publish_validated.sh
+
+      - name: Cleanup isolated scratch and Docker disk usage
+        if: always()
+        shell: bash
+        run: |
+          for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            rm -rf -- "$dir" || echo "::warning::Could not remove $dir"
+          done
+          echo "=== Docker disk usage before cleanup ==="
+          docker system df || true
+          docker container prune -f || true
+          docker image prune -f || true
+          echo "=== Docker disk usage after cleanup ==="
+          docker system df || true
+
+      - name: Fail job if any model failed
+        if: steps.test.outcome == 'failure'
+        run: exit 1

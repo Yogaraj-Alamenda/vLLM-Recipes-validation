@@ -48,6 +48,10 @@ jobs:
       # Optional repo variable. When unset, settings.env falls back to
       # $HOME/.cache/huggingface on the self-hosted runner.
       HF_HOME: ${{ vars.HF_HOME }}
+      # Each attempt uses scratch outside checkout. Root-owned Docker files
+      # cannot poison actions/checkout on subsequent jobs on this runner.
+      WORK_ROOT: ${{ runner.temp }}/xeon6-weekly-${{ github.run_id }}-${{ github.run_attempt }}/work
+      RESULT_ROOT: ${{ runner.temp }}/xeon6-weekly-${{ github.run_id }}-${{ github.run_attempt }}/results
       # HF_TOKEN should be stored as an internal-repo/environment secret if gated
       # models are part of the Xeon recipe catalog.
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -124,6 +128,23 @@ jobs:
         continue-on-error: true
         run: ./scripts/weekly.sh
 
+      - name: Restore scratch ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Repair only this run's scratch; never recursively chown HF_HOME.
+          # An interrupted run cannot block the next checkout, as scratch is
+          # uniquely named and located outside GITHUB_WORKSPACE.
+          if docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+            for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+              [[ -d "$dir" ]] || continue
+              docker run --rm --user 0:0 --entrypoint /bin/sh \
+                -v "$dir:/repair" "$VLLM_IMAGE" \
+                -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+            done
+          fi
+
       - name: Show validation summary
         if: always()
         shell: bash
@@ -135,8 +156,8 @@ jobs:
           import shlex
           from pathlib import Path
 
-          summary_path = Path("results/weekly-summary.json")
-          system_info_path = Path("results/system-info.txt")
+          summary_path = Path(os.environ["RESULT_ROOT"]) / "weekly-summary.json"
+          system_info_path = Path(os.environ["RESULT_ROOT"]) / "system-info.txt"
           out = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
           def md_escape(value):
@@ -305,7 +326,7 @@ jobs:
         with:
           name: xeon6-weekly-${{ github.run_number }}
           path: |
-            results/
+            ${{ env.RESULT_ROOT }}/
             history/**/${{ env.VALIDATION_RUN_ID }}/
           retention-days: 90
 
@@ -321,10 +342,14 @@ jobs:
         if: always()
         run: ./scripts/publish_validated.sh
 
-      - name: Cleanup Docker disk usage
+      - name: Cleanup isolated scratch and Docker disk usage
         if: always()
         shell: bash
         run: |
+          for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            rm -rf -- "$dir" || echo "::warning::Could not remove $dir"
+          done
           echo "=== Docker disk usage before cleanup ==="
           docker system df || true
 

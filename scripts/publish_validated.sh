@@ -3,21 +3,22 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 BRANCH=${VALIDATED_BRANCH:-validated-xeon6}
+RESULT_DIR=${RESULT_ROOT:-$ROOT/results}
 PUB=$(mktemp -d)
 trap 'git -C "$ROOT" worktree remove --force "$PUB" >/dev/null 2>&1 || true; rm -rf "$PUB"' EXIT
 
-if [[ ! -f "$ROOT/results/weekly-summary.json" || ! -f "$ROOT/results/weekly-summary.html" ]]; then
+if [[ ! -f "$RESULT_DIR/weekly-summary.json" || ! -f "$RESULT_DIR/weekly-summary.html" ]]; then
   echo "No weekly summary was generated; skipping catalog publication" >&2
   exit 0
 fi
 
 mkdir -p "$ROOT/latest"
-cp "$ROOT/results/weekly-summary.json" "$ROOT/latest/xeon6-validation.json"
-cp "$ROOT/results/weekly-summary.html" "$ROOT/latest/xeon6-validation.html"
-cp "$ROOT/results/discovery.json" "$ROOT/latest/xeon6-discovery.json"
-cp "$ROOT/results/run-metadata.json" "$ROOT/latest/run-metadata.json"
+cp "$RESULT_DIR/weekly-summary.json" "$ROOT/latest/xeon6-validation.json"
+cp "$RESULT_DIR/weekly-summary.html" "$ROOT/latest/xeon6-validation.html"
+cp "$RESULT_DIR/discovery.json" "$ROOT/latest/xeon6-discovery.json"
+cp "$RESULT_DIR/run-metadata.json" "$ROOT/latest/run-metadata.json"
 
-HISTORY_REL=$(python3 - "$ROOT/results/run-metadata.json" <<'PY'
+HISTORY_REL=$(python3 - "$RESULT_DIR/run-metadata.json" <<'PY'
 import json
 import sys
 from pathlib import Path
