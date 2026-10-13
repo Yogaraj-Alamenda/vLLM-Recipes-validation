@@ -126,8 +126,8 @@ def main() -> int:
             f"<td>{html.escape(str(stages.get('conversion','-')))}</td>"
             f"<td>{html.escape(str(stages.get('startup','-')))}</td>"
             f"<td>{html.escape(str(stages.get('benchmark','-')))}</td>"
-            f"<td>{html.escape(str(m.get('mean_ttft_ms','-')))}</td>"
-            f"<td>{html.escape(str(m.get('mean_tpot_ms','-')))}</td>"
+            f"<td>{html.escape(str(m.get('p99_ttft_ms','-')))}</td>"
+            f"<td>{html.escape(str(m.get('p99_tpot_ms','-')))}</td>"
             f"<td>{html.escape(str(m.get('output_throughput','-')))}</td>"
             f"<td class='error'>{error}</td>"
             "</tr>"
@@ -156,7 +156,7 @@ Generated: <code>{html.escape(generated_at)}</code></p>
 <div class='card'><strong>Failed</strong><br>{summary['failed']}</div>
 </div>
 <p>Quick performance workload: 128 input / 128 output, concurrency 1 by default; each result records the exact workload.</p>
-<table><thead><tr><th>Model</th><th>Status</th><th>Convert</th><th>Startup</th><th>Benchmark</th><th>Mean TTFT ms</th><th>Mean TPOT ms</th><th>Output tok/s</th><th>Error</th></tr></thead>
+<table><thead><tr><th>Model</th><th>Status</th><th>Convert</th><th>Startup</th><th>Benchmark</th><th>P99 TTFT ms</th><th>P99 TPOT ms</th><th>Output tok/s</th><th>Error</th></tr></thead>
 <tbody>{''.join(trs)}</tbody></table>
 </body></html>"""
     latest_html = results_root / "weekly-summary.html"

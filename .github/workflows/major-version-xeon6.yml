@@ -69,7 +69,7 @@ jobs:
       TEST_MODEL: ${{ inputs.model }}
       RECIPES_BASE_URL: ${{ inputs.recipe_api_base || 'https://recipes.vllm.ai' }}
       VLLM_TEST_ENV_VARS: ${{ inputs.vllm_env_vars || '' }}
-      BENCH_NUM_PROMPTS: "20"
+      BENCH_NUM_PROMPTS: "100"
       VALIDATION_RUN_ID: major-${{ github.run_number }}-attempt-${{ github.run_attempt }}
       REQUESTED_VERSION: ${{ inputs.vllm_version }}
       REQUESTED_IMAGE: ${{ inputs.vllm_image }}
@@ -169,7 +169,7 @@ jobs:
                   f.write('| Tested | Passed | Failed |\n| ---: | ---: | ---: |\n')
                   f.write(f"| {data.get('tested', 0)} | {data.get('passed', 0)} | {data.get('failed', 0)} |\n")
                   f.write('\n## Models\n\n')
-                  f.write('| Model | Status | Convert | Startup | Benchmark | Mean TTFT ms | Mean TPOT ms | Output tok/s | Error |\n')
+                  f.write('| Model | Status | Convert | Startup | Benchmark | P99 TTFT ms | P99 TPOT ms | Output tok/s | Error |\n')
                   f.write('| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |\n')
                   for item in data.get('models', []):
                       status = item.get('status', 'UNKNOWN')
@@ -184,8 +184,8 @@ jobs:
                           cell(stages.get('conversion', '-')),
                           cell(stages.get('startup', '-')),
                           cell(stages.get('benchmark', '-')),
-                          cell(metrics.get('mean_ttft_ms', '-')),
-                          cell(metrics.get('mean_tpot_ms', '-')),
+                          cell(metrics.get('p99_ttft_ms', '-')),
+                          cell(metrics.get('p99_tpot_ms', '-')),
                           cell(metrics.get('output_throughput', '-')),
                           error,
                       ]

@@ -282,7 +282,7 @@ jobs:
               "",
               "## Models",
               "",
-              "| Model | Status | Convert | Startup | Benchmark | Mean TTFT ms | Mean TPOT ms | Output tok/s | Error |",
+              "| Model | Status | Convert | Startup | Benchmark | P99 TTFT ms | P99 TPOT ms | Output tok/s | Error |",
               "| --- | --- | --- | --- | --- | ---: | ---: | ---: | --- |",
           ]
 
@@ -302,8 +302,8 @@ jobs:
                       stages.get("conversion", "-"),
                       stages.get("startup", "-"),
                       stages.get("benchmark", "-"),
-                      metrics.get("mean_ttft_ms", "-"),
-                      metrics.get("mean_tpot_ms", "-"),
+                      metrics.get("p99_ttft_ms", "-"),
+                      metrics.get("p99_tpot_ms", "-"),
                       metrics.get("output_throughput", "-"),
                       error or "-",
                   )

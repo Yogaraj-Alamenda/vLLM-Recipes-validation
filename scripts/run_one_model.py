@@ -235,8 +235,10 @@ def extract_metrics(data):
         "output_throughput": ["output_throughput", "output_throughput_tps"],
         "mean_ttft_ms": ["mean_ttft_ms", "mean_ttft"],
         "median_ttft_ms": ["median_ttft_ms", "median_ttft"],
+        "p99_ttft_ms": ["p99_ttft_ms", "p99_ttft"],
         "mean_tpot_ms": ["mean_tpot_ms", "mean_tpot"],
         "median_tpot_ms": ["median_tpot_ms", "median_tpot"],
+        "p99_tpot_ms": ["p99_tpot_ms", "p99_tpot"],
         "mean_e2el_ms": ["mean_e2el_ms", "mean_e2el", "mean_e2e_latency_ms"],
     }
     out = {}
@@ -609,6 +611,10 @@ def main() -> int:
             str(args.request_rate),
             "--max-concurrency",
             str(args.max_concurrency),
+            "--percentile-metrics",
+            "ttft,tpot",
+            "--metric-percentiles",
+            "99",
             "--save-result",
             "--save-detailed",
             "--result-dir",
