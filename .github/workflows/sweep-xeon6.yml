@@ -1,16 +1,27 @@
-name: Xeon 6 Recipe Sweep
+name: Intel Xeon Recipe Sweep
 
 on:
   workflow_dispatch:
     inputs:
-      runner:
-        description: "Select Xeon 6 runner"
+      location:
+        description: "Runner location"
         required: true
         type: choice
         default: local
         options:
           - local
           - aws
+      xeon_generation:
+        description: "Physical Intel Xeon generation"
+        required: true
+        type: choice
+        default: xeon6
+        options:
+          - xeon2
+          - xeon3
+          - xeon4
+          - xeon5
+          - xeon6
       model:
         description: "Exact model ID to sweep (one model per run)"
         required: true
@@ -74,10 +85,10 @@ on:
 permissions:
   contents: read
 
-# A sweep consumes the whole benchmark host. Queue dispatches instead of running
-# competing experiments on the same Xeon system.
+# Serialize sweeps targeting the same location and Xeon generation.
+# Allow independent machines to sweep concurrently.
 concurrency:
-  group: xeon6-recipe-sweep
+  group: recipe-sweep-${{ inputs.location }}-${{ inputs.xeon_generation }}
   cancel-in-progress: false
 
 jobs:
@@ -86,9 +97,9 @@ jobs:
       - self-hosted
       - linux
       - x64
-      - xeon6
       - recipe-validation
-      - ${{ inputs.runner == 'aws' && 'aws' || 'local' }}
+      - ${{ inputs.location }}
+      - ${{ inputs.xeon_generation }}
     timeout-minutes: 10080
 
     env:
@@ -105,7 +116,11 @@ jobs:
       RECIPES_BASE_URL: ${{ inputs.recipe_api_base }}
       RECIPE_TOOLS_REPO: ${{ inputs.recipe_tools_repo }}
       RECIPE_TOOLS_REF: ${{ inputs.recipe_tools_ref }}
+      # Recipe catalog currently provides Xeon 6 configurations only.
+      # This is a cross-generation experiment on non-Xeon-6 physical CPUs.
       HARDWARE: xeon6
+      RUNNER_LOCATION: ${{ inputs.location }}
+      PHYSICAL_XEON_GENERATION: ${{ inputs.xeon_generation }}
       WORK_ROOT: ${{ github.workspace }}/work/sweep
       RESULT_ROOT: ${{ github.workspace }}/results/sweep
 
@@ -249,7 +264,7 @@ jobs:
           scheduler = read_json(sweep_dir / "recommendation.json")
 
           lines = [
-              "# Xeon 6 Recipe Sweep",
+              "# Intel Xeon Recipe Sweep",
               "",
               f"**Run:** `{os.environ.get('GITHUB_RUN_NUMBER', 'unknown')}`  ",
               f"**Generated:** `{metadata.get('generated_at', 'unknown')}`  ",
@@ -262,6 +277,10 @@ jobs:
               "",
               "| Setting | Value |",
               "| --- | --- |",
+              f"| Runner location | `{md(os.environ.get('RUNNER_LOCATION', 'unknown'))}` |",
+              f"| Physical Xeon generation | `{md(os.environ.get('PHYSICAL_XEON_GENERATION', 'unknown'))}` |",
+              f"| Recipe hardware baseline | `{md(os.environ.get('HARDWARE', 'unknown'))}` |",
+              f"| GitHub runner | `{md(os.environ.get('RUNNER_NAME', 'unknown'))}` |",
               f"| Docker image | `{md(os.environ.get('VLLM_IMAGE', 'unknown'))}` |",
               f"| Recipes URL | `{md(os.environ.get('RECIPES_BASE_URL', 'unknown'))}` |",
               f"| Sweep stage | `{md(os.environ.get('SWEEP_STAGE', 'all'))}` |",
