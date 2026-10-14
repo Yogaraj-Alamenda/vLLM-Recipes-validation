@@ -582,6 +582,19 @@ def main() -> int:
         else:
             result["stages"]["benchmark_dependencies"] = "SKIP"
 
+        # Whisper's HF dataset loader may create lock files as container-root.
+        # Isolate only the benchmark client's Hub and datasets caches in this
+        # attempt's scratch workdir; keep the server's shared weight cache intact.
+        benchmark_cache_env = []
+        if args.model == "openai/whisper-large-v3":
+            whisper_cache = work / "whisper-benchmark-hf-cache"
+            whisper_cache.mkdir(parents=True, exist_ok=True)
+            benchmark_cache_env = [
+                "-e", "HF_HOME=/validation/whisper-benchmark-hf-cache",
+                "-e", "HF_HUB_CACHE=/validation/whisper-benchmark-hf-cache/hub",
+                "-e", "HF_DATASETS_CACHE=/validation/whisper-benchmark-hf-cache/datasets",
+            ]
+
         bench_cmd = [
             "docker",
             "exec",
@@ -589,6 +602,7 @@ def main() -> int:
             # benchmark client process or its tokenizer/helper kernels.
             *(["-e", "TRITON_RUNTIME_TRACE=0"]
               if os.environ.get("TRITON_TRACE_SITE_DIR") else []),
+            *benchmark_cache_env,
             container,
             "vllm",
             "bench",
@@ -691,14 +705,22 @@ def main() -> int:
                     stderr=subprocess.STDOUT,
                     timeout=args.bench_timeout,
                 )
-            result["stages"]["benchmark"] = "PASS"
             bench_json = find_latest_json(bench_dir)
-            if bench_json:
-                raw = load_json(bench_json)
-                result["benchmark_result_file"] = str(
-                    bench_json.relative_to(result_dir)
+            if bench_json is None:
+                raise RuntimeError("benchmark finished without a result JSON")
+            raw = load_json(bench_json)
+            result["benchmark_result_file"] = str(
+                bench_json.relative_to(result_dir)
+            )
+            result["metrics"] = extract_metrics(raw)
+            completed = result["metrics"].get("completed")
+            # A zero-success benchmark may exit 0; never promote it as PASS.
+            if isinstance(completed, bool) or not isinstance(completed, (int, float)) or completed <= 0:
+                raise RuntimeError(
+                    f"benchmark reported no successful requests "
+                    f"(completed={completed!r})"
                 )
-                result["metrics"] = extract_metrics(raw)
+            result["stages"]["benchmark"] = "PASS"
             result["status"] = "PASS"
             return_code = 0
         except Exception as exc:

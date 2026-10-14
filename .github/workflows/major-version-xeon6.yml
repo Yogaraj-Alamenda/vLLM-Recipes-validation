@@ -70,6 +70,8 @@ jobs:
       RECIPES_BASE_URL: ${{ inputs.recipe_api_base || 'https://recipes.vllm.ai' }}
       VLLM_TEST_ENV_VARS: ${{ inputs.vllm_env_vars || '' }}
       BENCH_NUM_PROMPTS: "100"
+      # Extended timeout for the 100-prompt major-version qualification.
+      BENCH_TIMEOUT_SEC: "7200"
       VALIDATION_RUN_ID: major-${{ github.run_number }}-attempt-${{ github.run_attempt }}
       REQUESTED_VERSION: ${{ inputs.vllm_version }}
       REQUESTED_IMAGE: ${{ inputs.vllm_image }}
