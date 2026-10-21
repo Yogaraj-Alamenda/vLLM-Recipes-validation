@@ -1,0 +1,21 @@
+# Installs IAXL/KVShrink from an intel-accel-for-llm source tree into a vLLM
+# CPU image. BASE is the intel-accel-for-llm docker/Dockerfile.dev image built
+# with DEVICE=cpu on top of the vLLM CPU image under test, so it already holds
+# the IAXL build/runtime dependencies (qatlib, idxd-config, Python packages).
+ARG BASE
+FROM ${BASE}
+
+ARG IAXL_QATLIB=
+ARG IAXL_SRC=/opt/intel-accel-for-llm
+
+COPY . ${IAXL_SRC}
+
+# Editable install, as intel-accel-for-llm start.sh does: setvars.sh and
+# tools/auto_config.sh stay next to the installed package for the serve shim.
+RUN cd "${IAXL_SRC}" \
+    && DEVICE=cpu IAXL_QATLIB="${IAXL_QATLIB}" \
+        python3 -m pip install --no-cache-dir -e . --no-build-isolation \
+    && python3 -c "import iaxl, kvshrink.kvshrink_connector"
+
+ENV IAXL_SRC=${IAXL_SRC}
+WORKDIR /vllm-workspace

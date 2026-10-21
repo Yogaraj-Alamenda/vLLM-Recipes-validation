@@ -1,0 +1,226 @@
+name: KVShrink Validation on Xeon 6 Recipes
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Exact model ID(s), space separated; empty runs every Xeon6 text-generation recipe (long)"
+        required: false
+        default: "Qwen/Qwen3-8B"
+      vllm_image:
+        description: "Official vLLM CPU image to build the KVShrink image on"
+        required: false
+        default: "vllm/vllm-openai-cpu:latest-x86_64"
+      kvshrink_repository:
+        description: "intel-accel-for-llm repository (owner/name) to build KVShrink from"
+        required: false
+        default: "intel/intel-accel-for-llm"
+      kvshrink_ref:
+        description: "intel-accel-for-llm branch, tag, or commit"
+        required: false
+        default: "main"
+      kvshrink_image:
+        description: "(optional) Prebuilt KVShrink image; skips the build and ignores repository/ref"
+        required: false
+        default: ""
+      iaxl_qatlib:
+        description: "QAT library: intree (in-tree driver + host qatmgr) or oot (out-of-tree package)"
+        required: false
+        type: choice
+        default: intree
+        options:
+          - intree
+          - oot
+      input_len:
+        description: "Total prompt tokens"
+        required: false
+        default: "8000"
+      hit_rate:
+        description: "Shared-prefix percent of each prompt"
+        required: false
+        default: "80"
+      output_len:
+        description: "Output tokens"
+        required: false
+        default: "128"
+      num_prompts:
+        description: "Benchmark prompts per run"
+        required: false
+        default: "10"
+      max_concurrency:
+        description: "Benchmark max concurrency"
+        required: false
+        default: "4"
+      kvshrink_env_vars:
+        description: "(optional) Non-secret KEY=VALUE IAXL/KVShrink settings for the KVShrink run; replaces the defaults in config/kvshrink.env"
+        required: false
+        default: ""
+      recipe_api_base:
+        description: "(optional) Recipes API base URL (production or Vercel preview)"
+        required: false
+        default: "https://recipes.vllm.ai"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kvshrink-xeon6
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    # Needs a Xeon 6 runner with QAT (VFs on vfio-pci and the host qatmgr for intree).
+    runs-on: [self-hosted, linux, x64, xeon6, recipe-validation, qat]
+    timeout-minutes: 10080
+
+    env:
+      HF_HOME: ${{ vars.HF_HOME }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      TEST_MODEL: ${{ inputs.model }}
+      VLLM_IMAGE: ${{ inputs.vllm_image || 'vllm/vllm-openai-cpu:latest-x86_64' }}
+      RECIPES_BASE_URL: ${{ inputs.recipe_api_base || 'https://recipes.vllm.ai' }}
+      KVSHRINK_IMAGE: ${{ inputs.kvshrink_image }}
+      IAXL_QATLIB: ${{ inputs.iaxl_qatlib == 'intree' && 'intree' || '' }}
+      KVSHRINK_INPUT_LEN: ${{ inputs.input_len || '8000' }}
+      KVSHRINK_HIT_RATE: ${{ inputs.hit_rate || '80' }}
+      KVSHRINK_OUTPUT_LEN: ${{ inputs.output_len || '128' }}
+      KVSHRINK_NUM_PROMPTS: ${{ inputs.num_prompts || '10' }}
+      KVSHRINK_MAX_CONCURRENCY: ${{ inputs.max_concurrency || '4' }}
+      VALIDATION_RUN_ID: run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
+
+    steps:
+      - name: Initialize isolated scratch directories
+        shell: bash
+        env:
+          INPUT_KVSHRINK_ENV_VARS: ${{ inputs.kvshrink_env_vars }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/kvshrink-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$scratch/work" "$scratch/results"
+          echo "WORK_ROOT=$scratch/work" >> "$GITHUB_ENV"
+          echo "RESULT_ROOT=$scratch/results" >> "$GITHUB_ENV"
+          if [[ -n "$INPUT_KVSHRINK_ENV_VARS" ]]; then
+            printf 'KVSHRINK_ENV_VARS=%s\n' "$(tr '\n' ' ' <<<"$INPUT_KVSHRINK_ENV_VARS")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout validation harness
+        uses: actions/checkout@v6
+
+      - name: Checkout intel-accel-for-llm
+        if: inputs.kvshrink_image == ''
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ inputs.kvshrink_repository || 'intel/intel-accel-for-llm' }}
+          ref: ${{ inputs.kvshrink_ref || 'main' }}
+          # Set KVSHRINK_REPO_TOKEN when the repository is private.
+          token: ${{ secrets.KVSHRINK_REPO_TOKEN || github.token }}
+          path: _kvshrink_src
+
+      - name: Point the build at the checkout
+        if: inputs.kvshrink_image == ''
+        run: echo "KVSHRINK_SRC=$GITHUB_WORKSPACE/_kvshrink_src" >> "$GITHUB_ENV"
+
+      - name: Resolve Hugging Face cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolved="${HF_HOME:-$HOME/.cache/huggingface}"
+          mkdir -p "$resolved"
+          resolved="$(readlink -f "$resolved")"
+          echo "HF_HOME=$resolved" >> "$GITHUB_ENV"
+          df -h "$resolved"
+
+      - name: Run KVShrink validation
+        id: test
+        continue-on-error: true
+        run: ./scripts/kvshrink_validate.sh
+
+      - name: Restore scratch ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            docker run --rm --user 0:0 --entrypoint /bin/sh \
+              -v "$dir:/repair" "$VLLM_IMAGE" \
+              -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)" || true
+          done
+
+      - name: Show KVShrink summary
+        if: always()
+        shell: bash
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESULT_ROOT"]) / "kvshrink-summary.json"
+          out = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          if not path.exists():
+              out.write_text("# KVShrink validation\n\nNo summary was generated; check the step logs.\n")
+              raise SystemExit(0)
+
+          def f(v, suffix=""):
+              if v is None:
+                  return "-"
+              return f"{v:,.2f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
+
+          data = json.loads(path.read_text())
+          w = data.get("workload", {})
+          img = data.get("kvshrink_image", {})
+          lines = [
+              "# KVShrink Validation on Xeon 6 Recipes",
+              "",
+              f"**Image:** `{img.get('image')}` (KVShrink {img.get('source')} "
+              f"`{img.get('ref') or '-'}` `{img.get('commit') or '-'}`, base `{img.get('base_image')}`)  ",
+              f"**Workload:** {w.get('input_tokens')} input ({w.get('hit_rate_percent')}% shared prefix), "
+              f"{w.get('output_tokens')} output, {w.get('num_prompts')} prompts, "
+              f"concurrency {w.get('max_concurrency')}, prefix caching {data.get('prefix_caching')}",
+              "",
+              f"Tested {data['tested']}, passed {data['passed']}, failed {data['failed']}.",
+              "",
+              "| Model | Status | TP | Mean TTFT base / KVShrink ms | TTFT speedup | P99 TTFT speedup | Mean TPOT base / KVShrink ms | TPOT change | KVShrink hits | Error |",
+              "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
+          ]
+          for r in data["models"]:
+              b, k, c, s = r["baseline"], r["kvshrink"], r["comparison"], r["kvshrink_stats"]
+              err = "; ".join(f"{a}: {e}" for a, e in r["errors"].items()).replace("|", "\\|")
+              lines.append(
+                  f"| `{r['model']}` | {'✅' if r['status'] == 'PASS' else '❌'} "
+                  f"{r['mode_status']['baseline']} / {r['mode_status']['kvshrink']} "
+                  f"| {r['tensor_parallel_size'] or '-'} "
+                  f"| {f(b['mean_ttft_ms'])} / {f(k['mean_ttft_ms'])} "
+                  f"| {f(c['mean_ttft_speedup'], 'x')} | {f(c['p99_ttft_speedup'], 'x')} "
+                  f"| {f(b['mean_tpot_ms'])} / {f(k['mean_tpot_ms'])} "
+                  f"| {f(c['mean_tpot_change_pct'], '%')} "
+                  f"| {s.get('hit_requests', '-')}/{s.get('lookups', '-')} | {err[:180] or '-'} |"
+              )
+          for s in data.get("skipped", []):
+              lines.append(f"\nSkipped `{s['model']}`: {s['reason']}")
+          out.write_text("\n".join(lines) + "\n")
+          PY
+
+      - name: Upload KVShrink results
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: kvshrink-xeon6-${{ github.run_number }}
+          path: ${{ env.RESULT_ROOT }}/
+          retention-days: 90
+
+      - name: Cleanup isolated scratch and Docker disk usage
+        if: always()
+        shell: bash
+        run: |
+          for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+            [[ -d "$dir" ]] || continue
+            rm -rf -- "$dir" || echo "::warning::Could not remove $dir"
+          done
+          docker container prune -f || true
+          docker image prune -f || true
+
+      - name: Fail job if any model failed
+        if: steps.test.outcome == 'failure'
+        run: exit 1

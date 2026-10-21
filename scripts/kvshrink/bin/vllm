@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# vllm shim for the KVShrink validation.
+#
+# Every command except `vllm serve` goes straight to the real vllm. For
+# `vllm serve` (the recipe's final step) it applies the mode selected by
+# KVSHRINK_MODE on top of the recipe config:
+#
+#   baseline  recipe as generated
+#   kvshrink  recipe + KVShrinkConnector, with NUMA-local CPU lists split
+#             between vLLM and IAXL and the IAXL settings from setvars.sh
+#
+# Both modes apply KVSHRINK_PREFIX_CACHING (off by default: every prefix hit
+# must come from KVShrink, matching intel-accel-for-llm's methodology).
+set -euo pipefail
+
+SHIM_BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+KVSHRINK_DIR=$(dirname "$SHIM_BIN")
+PATH=$(tr ':' '\n' <<<"$PATH" | grep -vxF "$SHIM_BIN" | paste -sd: -)
+export PATH
+REAL_VLLM=$(command -v vllm)
+
+if [[ "${1:-}" != serve ]]; then
+    exec "$REAL_VLLM" "$@"
+fi
+
+die() {
+    echo "kvshrink shim: ERROR: $*" >&2
+    exit 1
+}
+
+extra_args=()
+case "${KVSHRINK_PREFIX_CACHING:-off}" in
+    off) extra_args+=(--no-enable-prefix-caching) ;;
+    on) ;;
+    *) die "KVSHRINK_PREFIX_CACHING must be on or off" ;;
+esac
+
+config=""
+args=("$@")
+for ((i = 1; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+        --config) config=${args[$((i + 1))]:-} ;;
+        --config=*) config=${args[$i]#*=} ;;
+    esac
+done
+
+mode=${KVSHRINK_MODE:-baseline}
+echo "==> KVShrink validation mode: $mode (prefix caching ${KVSHRINK_PREFIX_CACHING:-off})"
+case "$mode" in
+    baseline)
+        exec "$REAL_VLLM" "$@" "${extra_args[@]}"
+        ;;
+    kvshrink) ;;
+    *) die "KVSHRINK_MODE must be baseline or kvshrink" ;;
+esac
+
+[[ -n "$config" && -f "$config" ]] || die "vllm serve was not started with --config <recipe config.yml>"
+: "${IAXL_SRC:?IAXL_SRC is not set; use an image built by build_kvshrink_image.sh}"
+[[ -f "$IAXL_SRC/setvars.sh" ]] || die "$IAXL_SRC/setvars.sh not found"
+
+layout=$(python3 "$KVSHRINK_DIR/kvshrink_layout.py" --config "$config") || die "rank layout failed"
+eval "$layout"
+echo "==> KVShrink rank layout ($KVSHRINK_RANK_LAYOUT): TP=$TP_SIZE DP=$DP_SIZE"
+echo "    vLLM CPUs: $VLLM_CPU_OMP_THREADS_BIND"
+echo "    IAXL CPUs: $KVSHRINK_CPU_OMP_THREADS_BIND"
+
+export DEVICE=cpu
+export IAXL_CACHE_DIR=${IAXL_CACHE_DIR:-/tmp/iaxl-kvcache}
+
+# setvars.sh rewrites the proxy variables for its docker helpers; keep the
+# container's values so model downloads behave the same in both modes.
+proxy_names=(http_proxy https_proxy no_proxy HTTP_PROXY HTTPS_PROXY NO_PROXY)
+declare -A saved_proxy=()
+for name in "${proxy_names[@]}"; do
+    [[ -v $name ]] && saved_proxy[$name]=${!name}
+done
+
+set +eu
+# shellcheck disable=SC1091
+source "$IAXL_SRC/setvars.sh"
+setvars_rc=$?
+set -eu
+[[ $setvars_rc -eq 0 && -n "${IAXL_OMP_THREAD_NUM:-}" ]] || die "setvars.sh failed (rc=$setvars_rc)"
+
+for name in "${proxy_names[@]}"; do
+    if [[ -v saved_proxy[$name] ]]; then
+        export "$name=${saved_proxy[$name]}"
+    else
+        unset "$name"
+    fi
+done
+
+kv_transfer_config='{"kv_connector":"KVShrinkConnector","kv_connector_module_path":"kvshrink.kvshrink_connector","kv_role":"kv_both"}'
+exec "$REAL_VLLM" "$@" --kv-transfer-config "$kv_transfer_config" "${extra_args[@]}"

@@ -262,6 +262,70 @@ def write_result(path: Path, result: dict) -> None:
     path.write_text(json.dumps(result, indent=2) + "\n")
 
 
+def kvshrink_docker_args(args, result: dict) -> list[str]:
+    """Container options for one KVShrink validation mode (mount, mode, devices, env)."""
+    shim_dir = Path(args.kvshrink_dir).resolve()
+    for name in ("entrypoint.sh", "bin/vllm", "kvshrink_layout.py"):
+        if not (shim_dir / name).is_file():
+            raise FileNotFoundError(f"KVShrink shim file missing: {shim_dir / name}")
+
+    prefix_caching = os.environ.get("KVSHRINK_PREFIX_CACHING", "off")
+    if prefix_caching not in ("on", "off"):
+        raise ValueError("KVSHRINK_PREFIX_CACHING must be on or off")
+
+    docker_args = [
+        "-v", f"{shim_dir}:/kvshrink:ro",
+        "-e", f"KVSHRINK_MODE={args.kvshrink_mode}",
+        "-e", f"KVSHRINK_PREFIX_CACHING={prefix_caching}",
+    ]
+    env_names: list[str] = []
+    if args.kvshrink_mode == "kvshrink":
+        docker_args.extend(shlex.split(os.environ.get("KVSHRINK_DOCKER_ARGS", "")))
+        if os.environ.get("KVSHRINK_IAXL_CORES"):
+            docker_args.extend(
+                ["-e", f"KVSHRINK_IAXL_CORES={os.environ['KVSHRINK_IAXL_CORES']}"]
+            )
+        # IAXL_QATLIB=intree ranks share QAT VFs through the host qatmgr.
+        if Path("/run/qat/qatmgr.sock").is_socket():
+            docker_args.extend(["-v", "/run/qat:/run/qat"])
+        for name, value in parse_container_env_overrides(
+            os.environ.get("KVSHRINK_ENV_VARS", "")
+        ):
+            docker_args.extend(["-e", f"{name}={value}"])
+            env_names.append(name)
+
+    result["kvshrink"] = {
+        "mode": args.kvshrink_mode,
+        "prefix_caching": prefix_caching,
+        "env_override_names": env_names,
+    }
+    return docker_args
+
+
+_KVSHRINK_HIT_RE = re.compile(r"externally-cached tokens: (\d+)")
+
+
+def kvshrink_log_stats(server_log: Path) -> dict:
+    """Summarize KVShrink activity from the connector log lines."""
+    text = server_log.read_text(errors="replace") if server_log.is_file() else ""
+    hits = [int(m) for m in _KVSHRINK_HIT_RE.findall(text)]
+    layout = next(
+        (
+            line.strip()
+            for line in text.splitlines()
+            if line.startswith("==> KVShrink rank layout")
+        ),
+        None,
+    )
+    return {
+        "connector_registered": "KV cache layers with shape" in text,
+        "lookups": len(hits),
+        "hit_requests": sum(1 for n in hits if n > 0),
+        "external_tokens": sum(hits),
+        "rank_layout": layout,
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -285,6 +349,23 @@ def main() -> int:
     ap.add_argument("--num-prompts", type=int, default=5)
     ap.add_argument("--max-concurrency", type=int, default=1)
     ap.add_argument("--request-rate", default="inf")
+    ap.add_argument(
+        "--prefix-len",
+        type=int,
+        default=0,
+        help="Shared random prefix tokens per prompt (adds --random-prefix-len)",
+    )
+    ap.add_argument("--num-warmups", type=int, default=0)
+    ap.add_argument(
+        "--kvshrink-mode",
+        choices=("baseline", "kvshrink"),
+        help="Run one KVShrink validation mode through the scripts/kvshrink vllm shim",
+    )
+    ap.add_argument(
+        "--kvshrink-dir",
+        default=str(Path(__file__).resolve().parent / "kvshrink"),
+        help="Directory with the KVShrink entrypoint and vllm shim",
+    )
     args = ap.parse_args()
 
     safe_name = args.model.replace("/", "__")
@@ -314,6 +395,8 @@ def main() -> int:
             "num_prompts": args.num_prompts,
             "max_concurrency": args.max_concurrency,
             "request_rate": args.request_rate,
+            "prefix_tokens": args.prefix_len,
+            "num_warmups": args.num_warmups,
         },
         "stages": {},
         "status": "FAIL",
@@ -373,6 +456,21 @@ def main() -> int:
         write_result(result_path, result)
         return 1
 
+    serve_script = (
+        "/recipes/serve_with_recipe.sh"
+        if recipes_dir
+        else "/vllm-workspace/tools/recipes/serve_with_recipe.sh"
+    )
+    kvshrink_args: list[str] = []
+    if args.kvshrink_mode:
+        try:
+            kvshrink_args = kvshrink_docker_args(args, result)
+        except (OSError, ValueError) as exc:
+            result["stages"]["container_env"] = "FAIL"
+            result["error"] = f"kvshrink_env: {exc}"
+            write_result(result_path, result)
+            return 1
+
     docker_cmd = [
         "docker",
         "run",
@@ -380,9 +478,7 @@ def main() -> int:
         "--name",
         container,
         "--entrypoint",
-        "/recipes/serve_with_recipe.sh"
-        if recipes_dir
-        else "/vllm-workspace/tools/recipes/serve_with_recipe.sh",
+        "/kvshrink/entrypoint.sh" if args.kvshrink_mode else serve_script,
         "--security-opt",
         "seccomp=unconfined",
         "--cap-add",
@@ -443,9 +539,13 @@ def main() -> int:
     for name, value in container_env_overrides:
         docker_cmd.extend(["-e", f"{name}={value}"])
 
+    docker_cmd.extend(kvshrink_args)
+    docker_cmd.append(args.image)
+    if args.kvshrink_mode:
+        docker_cmd.append(serve_script)
+
     docker_cmd.extend(
         [
-            args.image,
             "--api-base",
             args.recipes_base_url,
             "--model",
@@ -645,6 +745,10 @@ def main() -> int:
                     "--ignore-eos",
                 ]
             )
+            if args.prefix_len > 0:
+                bench_cmd.extend(["--random-prefix-len", str(args.prefix_len)])
+        if args.num_warmups > 0:
+            bench_cmd.extend(["--num-warmups", str(args.num_warmups)])
 
         dataset_path = benchmark_override.get("dataset_path")
         if dataset_path:
@@ -721,11 +825,28 @@ def main() -> int:
                     f"(completed={completed!r})"
                 )
             result["stages"]["benchmark"] = "PASS"
+            if args.kvshrink_mode == "kvshrink":
+                save_docker_logs(container, server_log_path)
+                stats = kvshrink_log_stats(server_log_path)
+                result["kvshrink"].update(stats)
+                if not stats["connector_registered"]:
+                    result["stages"]["kvshrink_connector"] = "FAIL"
+                    raise RuntimeError("KVShrinkConnector did not register KV caches")
+                result["stages"]["kvshrink_connector"] = "PASS"
+                if args.prefix_len > 0 and stats["hit_requests"] == 0:
+                    result["stages"]["kvshrink_hits"] = "FAIL"
+                    raise RuntimeError("no request loaded KV blocks from KVShrink")
+                result["stages"]["kvshrink_hits"] = (
+                    "PASS" if stats["hit_requests"] else "SKIP"
+                )
             result["status"] = "PASS"
             return_code = 0
         except Exception as exc:
-            result["stages"]["benchmark"] = "FAIL"
-            result["error"] = f"benchmark: {exc}"
+            if result["stages"].get("benchmark") == "PASS":
+                result["error"] = f"kvshrink: {exc}"
+            else:
+                result["stages"]["benchmark"] = "FAIL"
+                result["error"] = f"benchmark: {exc}"
             return_code = 1
         finally:
             if native_perf is not None:
@@ -743,6 +864,8 @@ def main() -> int:
         if started:
             save_docker_logs(container, server_log_path)
             remove_container(container)
+            if args.kvshrink_mode == "kvshrink":
+                result["kvshrink"].update(kvshrink_log_stats(server_log_path))
         copy_candidates(work, result_dir)
         write_result(result_path, result)
 
