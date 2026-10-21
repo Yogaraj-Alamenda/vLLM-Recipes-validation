@@ -68,36 +68,54 @@ jobs:
       VALIDATION_RUN_ID: nightly-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}
 
     steps:
-      # Recover legacy Triton dumps before checkout cleans the persistent workspace.
-      # Old inspection runs wrote root-owned files under this directory.
-      - name: Recover legacy Triton files before checkout
+      # Repair disposable directories created by older root-running containers.
+      # This must happen BEFORE checkout because checkout cleans the old worktree.
+      # New test scratch is outside GITHUB_WORKSPACE (see next step).
+      - name: Remove legacy container-owned workspace directories
         shell: bash
         run: |
           set -euo pipefail
-          legacy="$GITHUB_WORKSPACE/triton-results"
-          if [[ -d "$legacy" ]]; then
-            echo "Repairing legacy Triton results at $legacy"
-            # Reuse a locally cached CPU image so recovery needs no registry pull.
-            image=""
-            for candidate in \
-              vllm/vllm-openai-cpu:nightly-x86_64 \
-              vllm/vllm-openai-cpu:nightly \
-              vllm/vllm-openai-cpu:latest-x86_64; do
-              if docker image inspect "$candidate" >/dev/null 2>&1; then
-                image="$candidate"
-                break
+          for legacy in \
+            "$GITHUB_WORKSPACE/triton-results" \
+            "$GITHUB_WORKSPACE/work" \
+            "$GITHUB_WORKSPACE/results"; do
+            [[ -e "$legacy" ]] || continue
+            echo "Cleaning legacy checkout path: $legacy"
+            if ! rm -rf -- "$legacy" 2>/dev/null; then
+              # Docker-root can repair files even if runner sudo is unavailable.
+              image=""
+              for candidate in \
+                vllm/vllm-openai-cpu:nightly-x86_64 \
+                vllm/vllm-openai-cpu:nightly \
+                vllm/vllm-openai-cpu:latest-x86_64; do
+                if docker image inspect "$candidate" >/dev/null 2>&1; then
+                  image="$candidate"
+                  break
+                fi
+              done
+              if [[ -n "$image" ]]; then
+                docker run --rm --user 0:0 --entrypoint /bin/sh \
+                  -v "$legacy:/repair" "$image" \
+                  -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+              else
+                sudo -n chown -R "$(id -u):$(id -g)" "$legacy" || {
+                  echo "::error::No cached repair image or passwordless sudo to fix $legacy"
+                  exit 1
+                }
               fi
-            done
-            if [[ -z "$image" ]]; then
-              echo '::error::No local vLLM CPU image for root-owned workspace repair. Run a one-time administrator cleanup.'
-              exit 1
+              rm -rf -- "$legacy"
             fi
-            docker run --rm --user 0:0 \
-              --entrypoint /bin/sh \
-              -v "$legacy:/repair" "$image" \
-              -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
-            rm -rf -- "$legacy"
-          fi
+          done
+
+      - name: Initialize isolated scratch directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/xeon6-nightly-${{ github.run_id }}-${{ github.run_attempt }}"
+          mkdir -p "$scratch/work" "$scratch/results"
+          echo "WORK_ROOT=$scratch/work" >> "$GITHUB_ENV"
+          echo "RESULT_ROOT=$scratch/results" >> "$GITHUB_ENV"
+
       - name: Checkout validation harness
         uses: actions/checkout@v6
 
@@ -159,6 +177,21 @@ jobs:
         continue-on-error: true
         run: ./scripts/weekly.sh
 
+      - name: Restore scratch ownership
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never chown the shared HF_HOME cache.
+          if docker image inspect "$VLLM_IMAGE" >/dev/null 2>&1; then
+            for dir in "$WORK_ROOT" "$RESULT_ROOT"; do
+              [[ -d "$dir" ]] || continue
+              docker run --rm --user 0:0 --entrypoint /bin/sh \
+                -v "$dir:/repair" "$VLLM_IMAGE" \
+                -c 'chown -R "$1:$2" /repair' _ "$(id -u)" "$(id -g)"
+            done
+          fi
+
       - name: Show validation summary
         if: always()
         shell: bash
@@ -170,8 +203,8 @@ jobs:
           import shlex
           from pathlib import Path
 
-          summary_path = Path("results/weekly-summary.json")
-          system_info_path = Path("results/system-info.txt")
+          summary_path = Path(os.environ["RESULT_ROOT"]) / "weekly-summary.json"
+          system_info_path = Path(os.environ["RESULT_ROOT"]) / "system-info.txt"
           out = Path(os.environ["GITHUB_STEP_SUMMARY"])
 
           def md_escape(value):
@@ -340,7 +373,7 @@ jobs:
         with:
           name: xeon6-nightly-${{ github.run_number }}
           path: |
-            results/
+            ${{ env.RESULT_ROOT }}/
             history/**/${{ env.VALIDATION_RUN_ID }}/
           retention-days: 90
 
@@ -360,6 +393,12 @@ jobs:
         if: always()
         shell: bash
         run: |
+          # Only remove this attempt's scratch; never the persistent HF cache.
+          for dir in "${WORK_ROOT:-}" "${RESULT_ROOT:-}"; do
+            [[ -n "$dir" && -d "$dir" ]] || continue
+            rm -rf -- "$dir" || echo "::warning::Could not remove $dir"
+          done
+
           echo "=== Docker disk usage before cleanup ==="
           docker system df || true
 
